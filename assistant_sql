@@ -1,0 +1,832 @@
+import streamlit as st
+import google.generativeai as genai
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from sqlalchemy import create_engine, text, inspect, MetaData
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import sessionmaker
+import logging
+import re
+import pandas as pd
+import os
+from dotenv import load_dotenv
+from typing import Dict, List, Optional, Tuple
+import json
+
+
+class EnhancedPostgreSQLAIAssistant:
+    def __init__(self, api_key: str, host: str, database: str, user: str, password: str, port: int = 5432):
+        self.api_key = api_key
+        self.host = host
+        self.database = database
+        self.user = user
+        self.password = password
+        self.port = port
+        self.connection = None
+        self.engine = None
+        self.metadata = MetaData()
+        self.schema_details = {}
+        self.table_relationships = {}
+        self.logger = self._setup_logging()
+        self.llm = None
+        self.schema_embeddings = None
+        self.Session = None
+        self.query_cache = {}
+        self.conversation_history = []
+        self.context_window = 5  # Number of previous exchanges to maintain
+
+    def _setup_logging(self):
+        logger = logging.getLogger('EnhancedPostgreSQLAIAssistant')
+        logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        return logger
+
+    def initialize(self) -> bool:
+        try:
+            # Initialize Google AI
+            genai.configure(api_key=self.api_key)
+            self.llm = ChatGoogleGenerativeAI(
+                model="gemini-1.5-flash",
+                temperature=0.1,
+                google_api_key=self.api_key,
+                top_p=0.95,
+                top_k=40,
+                # max_output_tokens=2048
+            )
+
+            # Connect and load schema
+            self._connect_to_database()
+            self._load_enhanced_schema()
+            self._analyze_relationships()
+            self._create_enhanced_embeddings()
+            return True
+        except Exception as e:
+            self.logger.error(f"Initialization failed: {str(e)}")
+            return False
+
+    def _connect_to_database(self):
+        try:
+            connection_string = (
+                f'postgresql://{self.user}:{self.password}@'
+                f'{self.host}:{self.port}/{self.database}'
+            )
+            self.engine = create_engine(connection_string)
+            self.Session = sessionmaker(bind=self.engine)
+            self.connection = self.engine.connect()
+            self.metadata.reflect(bind=self.engine)
+            self.logger.info("Database connection established")
+        except SQLAlchemyError as e:
+            self.logger.error(f"Database connection failed: {str(e)}")
+            raise
+
+    def _get_detailed_table_info(self, inspector, schema_name: str, table_name: str) -> Dict:
+        """Get detailed table information using SQLAlchemy's inspector."""
+        try:
+            # Get columns information
+            columns = inspector.get_columns(table_name, schema=schema_name)
+
+            # Get primary key info using get_pk_constraint instead of get_primary_keys
+            pk_constraint = inspector.get_pk_constraint(table_name, schema=schema_name)
+            primary_keys = pk_constraint['constrained_columns'] if pk_constraint else []
+
+            # Get foreign keys
+            foreign_keys = inspector.get_foreign_keys(table_name, schema=schema_name)
+
+            # Get indexes
+            indexes = inspector.get_indexes(table_name, schema=schema_name)
+
+            # Get unique constraints
+            unique_constraints = inspector.get_unique_constraints(table_name, schema=schema_name)
+
+            # Get sample data for better context
+            sample_data = self._get_sample_data(schema_name, table_name)
+
+            # Build column details with corrected primary key check
+            column_details = {
+                col['name']: {
+                    'type': str(col['type']),
+                    'nullable': col.get('nullable', True),
+                    'primary_key': col['name'] in primary_keys,
+                    'foreign_key': any(col['name'] in fk['constrained_columns'] for fk in foreign_keys),
+                    'sample_values': sample_data.get(col['name'], []) if sample_data else []
+                } for col in columns
+            }
+
+            return {
+                'columns': column_details,
+                'primary_keys': primary_keys,
+                'foreign_keys': foreign_keys,
+                'indexes': indexes,
+                'unique_constraints': unique_constraints,
+                'relationships': []  # Will be populated in _analyze_relationships
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error getting table info for {schema_name}.{table_name}: {str(e)}")
+            raise
+
+    def _build_conversation_context(self) -> str:
+        """Build context from previous conversations."""
+        if not self.conversation_history:
+            return ""
+
+        context = "\nPrevious conversation context:\n"
+        for exchange in self.conversation_history[-self.context_window:]:
+            context += f"User: {exchange['question']}\n"
+            if 'query' in exchange:
+                context += f"Generated SQL: {exchange['query']}\n"
+            if 'answer' in exchange:
+                context += f"Response: {exchange['answer']}\n"
+        return context
+
+    def _load_enhanced_schema(self):
+        """Load enhanced schema with proper error handling for XML and custom types."""
+        try:
+            inspector = inspect(self.engine)
+            self.schema_details = {}
+
+            # Enhanced schema loading with comprehensive metadata
+            for schema_name in inspector.get_schema_names():
+                if schema_name in ['pg_catalog', 'information_schema']:
+                    continue
+
+                self.schema_details[schema_name] = {}
+
+                # Get list of tables with error handling for each table
+                tables = []
+                try:
+                    tables = inspector.get_table_names(schema=schema_name)
+                except Exception as e:
+                    self.logger.error(f"Error getting tables for schema {schema_name}: {str(e)}")
+                    continue
+
+                for table_name in tables:
+                    try:
+                        table_info = self._get_detailed_table_info(inspector, schema_name, table_name)
+                        self.schema_details[schema_name][table_name] = table_info
+                    except Exception as e:
+                        self.logger.error(f"Error processing table {schema_name}.{table_name}: {str(e)}")
+                        # Continue with next table instead of failing completely
+                        continue
+
+            self.logger.info("Enhanced schema loaded successfully")
+
+        except SQLAlchemyError as e:
+            self.logger.error(f"Schema loading failed: {str(e)}")
+            raise
+
+    def _get_sample_data(self, schema_name: str, table_name: str, limit: int = 5) -> Dict:
+        try:
+            query = f'SELECT * FROM {schema_name}.{table_name} LIMIT {limit}'
+            df = pd.read_sql(query, self.engine)
+            return df.to_dict(orient='list')
+        except Exception as e:
+            self.logger.warning(f"Could not get sample data for {schema_name}.{table_name}: {str(e)}")
+            return {}
+
+    def _analyze_relationships(self):
+        """Analyze and store table relationships including indirect relationships."""
+        for schema_name, tables in self.schema_details.items():
+            for table_name, table_info in tables.items():
+                relationships = []
+
+                # Direct relationships through foreign keys
+                for fk in table_info['foreign_keys']:
+                    relationships.append({
+                        'type': 'direct',
+                        'referenced_schema': fk['referred_schema'],
+                        'referenced_table': fk['referred_table'],
+                        'columns': {
+                            'local': fk['constrained_columns'],
+                            'foreign': fk['referred_columns']
+                        }
+                    })
+
+                # Find indirect relationships
+                indirect = self._find_indirect_relationships(schema_name, table_name)
+                relationships.extend(indirect)
+
+                self.schema_details[schema_name][table_name]['relationships'] = relationships
+
+    def _find_indirect_relationships(self, schema_name: str, table_name: str) -> List[Dict]:
+        """Find indirect relationships through intermediate tables."""
+        indirect_relationships = []
+        visited = set()
+
+        def traverse_relationships(current_schema: str, current_table: str, path: List[str], depth: int):
+            if depth > 3 or f"{current_schema}.{current_table}" in visited:  # Limit depth to prevent excessive traversal
+                return
+
+            visited.add(f"{current_schema}.{current_table}")
+            current_table_info = self.schema_details[current_schema][current_table]
+
+            for fk in current_table_info['foreign_keys']:
+                referenced_schema = fk['referred_schema']
+                referenced_table = fk['referred_table']
+
+                if referenced_schema and referenced_table:
+                    new_path = path + [(current_schema, current_table)]
+                    if len(new_path) > 1:
+                        indirect_relationships.append({
+                            'type': 'indirect',
+                            'path': new_path,
+                            'referenced_schema': referenced_schema,
+                            'referenced_table': referenced_table,
+                            'intermediate_tables': [p[1] for p in new_path[1:-1]]
+                        })
+
+                    traverse_relationships(referenced_schema, referenced_table, new_path, depth + 1)
+
+        traverse_relationships(schema_name, table_name, [], 0)
+        return indirect_relationships
+
+    def _create_enhanced_embeddings(self):
+        """Create more detailed embeddings including relationships and sample data."""
+        schema_text = self._generate_enhanced_schema_description()
+        embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/embedding-001",
+            google_api_key=self.api_key
+        )
+        self.schema_embeddings = FAISS.from_texts([schema_text], embeddings)
+
+    def _generate_enhanced_schema_description(self) -> str:
+        """Generate a comprehensive schema description including relationships and sample data."""
+        descriptions = []
+
+        for schema_name, tables in self.schema_details.items():
+            descriptions.append(f"\nSchema: {schema_name}")
+
+            for table_name, table_info in tables.items():
+                descriptions.append(f"\nTable: {table_name}")
+                descriptions.append("Columns:")
+
+                for col_name, col_info in table_info['columns'].items():
+                    constraints = []
+                    if col_info['primary_key']:
+                        constraints.append("PRIMARY KEY")
+                    if col_info['foreign_key']:
+                        constraints.append("FOREIGN KEY")
+                    if not col_info['nullable']:
+                        constraints.append("NOT NULL")
+
+                    constraint_str = f" ({', '.join(constraints)})" if constraints else ""
+                    sample_values = col_info.get('sample_values', [])
+                    sample_str = f" Sample values: {sample_values[:3]}" if sample_values else ""
+
+                    descriptions.append(
+                        f"  - {col_name} ({col_info['type']}){constraint_str}{sample_str}"
+                    )
+
+                # Add relationships
+                if table_info['relationships']:
+                    descriptions.append("\nRelationships:")
+                    for rel in table_info['relationships']:
+                        if rel['type'] == 'direct':
+                            descriptions.append(
+                                f"  - Direct relation to {rel['referenced_schema']}.{rel['referenced_table']} "
+                                f"via {rel['columns']['local']} -> {rel['columns']['foreign']}"
+                            )
+                        else:
+                            path_str = " -> ".join([f"{s}.{t}" for s, t in rel['path']])
+                            descriptions.append(f"  - Indirect relation through: {path_str}")
+
+        return "\n".join(descriptions)
+
+    def generate_sql_query(self, user_question: str) -> Optional[str]:
+        if user_question in self.query_cache:
+            return self.query_cache[user_question]
+
+        try:
+            # Get conversation context
+            conversation_context = self._build_conversation_context()
+
+            # Create schema context
+            schema_context = self._generate_enhanced_schema_description()
+
+            prompt = f"""
+            You are a PostgreSQL query generator with complete knowledge of the following database schema:
+
+            {schema_context}
+
+            {conversation_context}
+
+            CONVERSATION CONTEXT RULES:
+            1. Consider the previous questions and answers when interpreting the current question
+            2. Resolve pronouns and references based on the conversation history
+            3. Maintain consistency with previous queries when relevant
+            4. Use context to understand implicit filters or conditions
+            5. Build upon previous queries when questions are related
+
+            STRICT RULES FOR QUERY GENERATION:
+            1. ONLY use tables and columns that exist in the schema above
+            2. ALWAYS use fully qualified names (schema.table.column)
+            3. NEVER generate queries with invalid tables or columns
+            4. ALWAYS use proper JOIN conditions based on the relationships defined
+            5. VALIDATE all table and column references against the schema
+            6. USE appropriate JOIN types based on the data requirements
+            7. INCLUDE proper WHERE clauses to filter data
+            8. ADD appropriate LIMIT clauses for large result sets
+            9. OPTIMIZE queries for performance
+            10. RESPECT all foreign key relationships
+            11. USE CTEs or subqueries when appropriate for complex operations
+            12. 9. **For categorical and string-based fields and similar text fields, always convert both the column and user input to lowercase using `LOWER()` and use `LIKE` with wildcard `%` on both sides for flexible matching.**  
+                   - Example: If filtering by employee name, use WHERE LOWER(employee.name) LIKE '%john%' to match anywhere in the name.Do not use COALESCE.
+
+            User Question: "{user_question}"
+
+            Generate a precise PostgreSQL query that:
+            1. Exactly matches the schema
+            2. Uses only existing tables and columns
+            3. Follows proper relationship paths
+            4. Returns exactly what the user asked for
+            5. Maintains consistency with previous context
+
+            Return ONLY the SQL query without any explanation or markdown.
+            """
+
+            response = self.llm.invoke(prompt)
+            query = response.content.strip()
+
+            # Remove any markdown code blocks
+            query = re.sub(r'```(?:sql)?(.*?)```', r'\1', query, flags=re.DOTALL).strip()
+
+            # Store the exchange in conversation history
+            exchange = {
+                'question': user_question,
+                'query': query,
+                'timestamp': pd.Timestamp.now()
+            }
+
+            # Validate the query
+            if self._validate_enhanced_query(query):
+                self.query_cache[user_question] = query
+                # Execute query and store results in conversation history
+                result = self.execute_query(query)
+                if result['success'] and 'data' in result:
+                    exchange['answer'] = f"Found {len(result['data'])} results"
+                self.conversation_history.append(exchange)
+                return query
+
+            return None
+
+        except Exception as e:
+            self.logger.error(f"Query generation failed: {str(e)}")
+            return None
+
+    def get_conversation_history(self) -> List[Dict]:
+        """Return the conversation history for debugging and display."""
+        return self.conversation_history
+
+    def _validate_enhanced_query(self, query: str) -> bool:
+        """Enhanced query validation with comprehensive checks."""
+        try:
+            # Check for dangerous operations
+            dangerous_patterns = [
+                r'\bDROP\b', r'\bDELETE\b', r'\bTRUNCATE\b', r'\bALTER\b',
+                r'\bEXEC\b', r'\bINSERT\b', r'\bUPDATE\b', r'\bGRANT\b'
+            ]
+            if any(re.search(pattern, query, re.IGNORECASE) for pattern in dangerous_patterns):
+                raise ValueError("Query contains dangerous operations")
+
+            # Parse and validate table/column references
+            referenced_objects = self._extract_query_objects(query)
+
+            # Validate each referenced object against schema
+            for schema_name, table_name, column_name in referenced_objects:
+                if not self._validate_object_reference(schema_name, table_name, column_name):
+                    raise ValueError(f"Invalid reference: {schema_name}.{table_name}.{column_name}")
+
+            # Validate JOIN conditions
+            if 'JOIN' in query.upper():
+                self._validate_join_conditions(query)
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Query validation failed: {str(e)}")
+            return False
+
+    def _extract_query_objects(self, query: str) -> List[Tuple[str, str, str]]:
+        """Extract schema, table, and column references from query."""
+        # This is a simplified example - you might want to use a proper SQL parser
+        pattern = r'([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)\.([a-zA-Z_][a-zA-Z0-9_]*)'
+        return re.findall(pattern, query)
+
+    def _validate_object_reference(self, schema: str, table: str, column: str) -> bool:
+        """Validate if a schema.table.column reference exists."""
+        # 🔹 Ensure schema is loaded
+        if not self.schema_details:
+            self._load_enhanced_schema()
+
+        if schema not in self.schema_details:
+            self.logger.warning(f"Schema {schema} not found in loaded details.")
+            return False
+
+        if table not in self.schema_details[schema]:
+            self.logger.warning(f"Table {table} not found in schema {schema}.")
+            return False
+
+        if column != '*' and column not in self.schema_details[schema][table]['columns']:
+            self.logger.warning(f"Column {column} not found in {schema}.{table}.")
+            return False
+
+        return True
+
+    def _validate_join_conditions(self, query: str):
+        """Validate that JOIN conditions use proper relationships."""
+        join_pattern = r'JOIN\s+([\w\.]+)\s+ON\s+(.+?)(?=\s+(?:LEFT|RIGHT|INNER|FULL)?\s*JOIN|\Z)'
+        joins = re.findall(join_pattern, query, re.IGNORECASE | re.DOTALL)
+
+        for table, condition in joins:
+            table_schema, table_name = table.split('.') if '.' in table else ('public', table)
+
+            # Ensure table exists in schema details
+            if not self._validate_object_reference(table_schema, table_name, '*'):
+                raise ValueError(f"Invalid join table: {table_schema}.{table_name}")
+
+            # Extract conditions (support multiple join conditions with AND)
+            conditions = re.split(r'\s+AND\s+', condition.strip(), flags=re.IGNORECASE)
+
+            for cond in conditions:
+                parts = cond.split('=')
+                if len(parts) != 2:
+                    continue  # Allow WHERE clauses like "WHERE project_id = 4"
+
+                left, right = parts[0].strip(), parts[1].strip()
+
+                # Validate both sides of the join condition
+                for part in [left, right]:
+                    if '.' in part:
+                        schema, table, column = part.split('.')
+                        if not self._validate_object_reference(schema, table, column):
+                            raise ValueError(f"Invalid join column reference: {part}")
+
+            # ✅ **Allow WHERE filters separately (e.g., `WHERE project_id = 4`)**
+            self.logger.info(f"Validated JOIN: {table} ON {condition}")
+
+        return True  # ✅ Valid JOIN conditions
+
+    def _validate_join_relationship(self, schema_name: str, table_name: str, condition: str):
+        """Validate that the join condition follows defined relationships."""
+        relationships = self.schema_details[schema_name][table_name]['relationships']
+
+        # Extract table pairs from the join condition
+        condition_pattern = r'(\w+)\.(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)\.(\w+)'
+        match = re.match(condition_pattern, condition.strip())
+        if not match:
+            raise ValueError(f"Cannot parse join condition: {condition}")
+
+        schema1, table1, col1, schema2, table2, col2 = match.groups()
+        table_pair = {f"{schema1}.{table1}", f"{schema2}.{table2}"}
+
+        # Check if this table pair exists in any relationship
+        valid_relationship = False
+        for rel in relationships:
+            if rel['type'] == 'direct':
+                rel_pair = {
+                    f"{schema_name}.{table_name}",
+                    f"{rel['referenced_schema']}.{rel['referenced_table']}"
+                }
+                if table_pair == rel_pair:
+                    valid_relationship = True
+                    break
+            elif rel['type'] == 'indirect':
+                # Check if the tables are part of an indirect relationship path
+                path_pairs = {f"{s}.{t}" for s, t in rel['path']}
+                if table_pair.issubset(path_pairs):
+                    valid_relationship = True
+                    break
+
+        if not valid_relationship:
+            raise ValueError(f"Join does not follow any defined relationship: {condition}")
+
+    def execute_query(self, query: str) -> Dict:
+        """Execute the validated query and return results."""
+        session = self.Session()
+        try:
+            # ✅ Print the SQL query before execution (for debugging)
+            self.logger.info(f"Executing SQL Query:\n{query}")
+
+            # ✅ Final validation before execution
+            if not self._validate_enhanced_query(query):
+                raise ValueError("Query validation failed")
+
+            result = session.execute(text(query))
+
+            if query.strip().lower().startswith('select'):
+                rows = result.fetchall()
+                headers = result.keys()
+                df = pd.DataFrame(rows, columns=headers)
+
+                return {
+                    'success': True,
+                    'data': df.to_dict(orient='records'),
+                    'headers': list(headers),
+                    'row_count': len(df),
+                    'query_executed': query
+                }
+
+            return {'success': True, 'message': 'Query executed successfully'}
+
+        except Exception as e:
+            self.logger.error(f"Query execution failed: {str(e)}")
+            return {'success': False, 'error': str(e), 'query_executed': query}
+
+        finally:
+            session.close()
+
+    def get_schema_info(self) -> Dict:
+        """Return detailed schema information for debugging and verification."""
+        return {
+            'schemas': list(self.schema_details.keys()),
+            'table_count': sum(len(tables) for tables in self.schema_details.values()),
+            'relationships': {
+                schema: {
+                    table: info['relationships']
+                    for table, info in tables.items()
+                }
+                for schema, tables in self.schema_details.items()
+            }
+        }
+
+def close(self):
+        """Properly close all database connections."""
+        if self.connection:
+            self.connection.close()
+            self.logger.info("Database connection closed")
+        if self.engine:
+            self.engine.dispose()
+            self.logger.info("Database engine disposed")
+
+def initialize_session_state():
+        """Initialize Streamlit session state with enhanced monitoring."""
+        if 'messages' not in st.session_state:
+            st.session_state.messages = []
+        if 'query_history' not in st.session_state:
+            st.session_state.query_history = []
+        if 'error_log' not in st.session_state:
+            st.session_state.error_log = []
+        if 'assistant' not in st.session_state:
+            # Load environment variables
+            load_dotenv()
+
+            # Configuration from environment variables with validation
+            config = {
+                'google_api_key': os.getenv('GOOGLE_API_KEY'),
+                'host': os.getenv('DB_HOST', 'localhost'),
+                'database': os.getenv('DB_NAME'),
+                'user': os.getenv('DB_USER'),
+                'password': os.getenv('DB_PASSWORD'),
+                'port': int(os.getenv('DB_PORT', 5432))
+            }
+
+            # Validate configuration
+            missing_configs = [k for k, v in config.items() if v is None]
+            if missing_configs:
+                st.error(f"Missing required configuration: {', '.join(missing_configs)}")
+                st.stop()
+
+            # Initialize assistant with monitoring
+            try:
+                st.session_state.assistant = EnhancedPostgreSQLAIAssistant(
+                    api_key=config['google_api_key'],
+                    host=config['host'],
+                    database=config['database'],
+                    user=config['user'],
+                    password=config['password'],
+                    port=config['port']
+                )
+                initialization_success = st.session_state.assistant.initialize()
+                if not initialization_success:
+                    st.error("Failed to initialize the SQL Assistant")
+                    st.stop()
+            except Exception as e:
+                st.error(f"Error initializing assistant: {str(e)}")
+                st.stop()
+
+def display_schema_info():
+        """Display database schema information in a collapsible section."""
+        with st.expander("Database Schema Information", expanded=False):
+            if 'assistant' in st.session_state:
+                schema_info = st.session_state.assistant.get_schema_info()
+
+                # Display available schemas
+                st.subheader("Available Schemas")
+                for schema in schema_info['schemas']:
+                    st.write(f"- {schema}")
+
+                # Display relationship information
+                st.subheader("Table Relationships")
+                for schema, tables in schema_info['relationships'].items():
+                    st.write(f"\nSchema: {schema}")
+                    for table, relationships in tables.items():
+                        if relationships:
+                            st.write(f"  Table: {table}")
+                            for rel in relationships:
+                                if rel['type'] == 'direct':
+                                    st.write(
+                                        f"    ↳ Direct relation to {rel['referenced_schema']}.{rel['referenced_table']}")
+                                else:
+                                    path = " → ".join([f"{s}.{t}" for s, t in rel['path']])
+                                    st.write(f"    ↳ Indirect relation: {path}")
+
+def display_query_history():
+        """Display query execution history in a collapsible section."""
+        with st.expander("Query History", expanded=False):
+            if 'query_history' in st.session_state and st.session_state.query_history:
+                for idx, entry in enumerate(reversed(st.session_state.query_history), 1):
+                    with st.container():
+                        st.write(f"Query #{idx}")
+                        st.code(entry['query'], language='sql')
+                        if entry['success']:
+                            st.success("Execution successful")
+                            if 'row_count' in entry:
+                                st.write(f"Rows returned: {entry['row_count']}")
+                        else:
+                            st.error(f"Error: {entry['error']}")
+                        st.write("---")
+
+def display_error_log():
+        """Display error log in a collapsible section."""
+        with st.expander("Error Log", expanded=False):
+            if 'error_log' in st.session_state and st.session_state.error_log:
+                for idx, error in enumerate(reversed(st.session_state.error_log), 1):
+                    st.error(f"Error #{idx}: {error['message']}")
+                    st.write(f"Timestamp: {error['timestamp']}")
+                    st.write(f"Type: {error['type']}")
+                    if 'query' in error:
+                        st.code(error['query'], language='sql')
+                    st.write("---")
+
+
+def main():
+    """Main application with enhanced features and monitoring."""
+    st.set_page_config(
+        page_title="Enhanced PostgreSQL AI Assistant",
+        page_icon="🤖",
+        layout="wide"
+    )
+
+    st.title("PostgreSQL AI Assistant 🚀")
+    st.write("Ask questions about your database in natural language with enhanced accuracy!")
+
+    # Initialize session state
+    initialize_session_state()
+
+    # Add sidebar with information and controls
+    with st.sidebar:
+        st.header("Assistant Information")
+        if 'assistant' in st.session_state:
+            schema_info = st.session_state.assistant.get_schema_info()
+            st.metric("Total Tables", schema_info['table_count'])
+            st.metric("Available Schemas", len(schema_info['schemas']))
+
+        # Add schema visualization toggle
+        if st.toggle("Show Schema Information"):
+            display_schema_info()
+
+        # Add query history toggle
+        if st.toggle("Show Query History"):
+            display_query_history()
+
+        # Add error log toggle
+        if st.toggle("Show Error Log"):
+            display_error_log()
+        if st.toggle("Show Conversation History"):
+            with st.expander("Conversation History", expanded=False):
+                if 'assistant' in st.session_state:
+                    history = st.session_state.assistant.get_conversation_history()
+                    for idx, exchange in enumerate(history, 1):
+                        st.write(f"Exchange #{idx}")
+                        st.write(f"Question: {exchange['question']}")
+                        if 'query' in exchange:
+                            st.code(exchange['query'], language='sql')
+                        if 'answer' in exchange:
+                            st.write(f"Response: {exchange['answer']}")
+                        st.write("---") 
+
+    # Display chat messages
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+            if "query" in message:
+                st.code(message["query"], language="sql")
+            if "data" in message:
+                st.dataframe(
+                    message["data"],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+    # Chat input with enhanced error handling
+    if prompt := st.chat_input("Ask a question about your data"):
+        # Display user message
+        with st.chat_message("user"):
+            st.write(prompt)
+        st.session_state.messages.append({"role": "user", "content": prompt})
+
+        # Generate and display assistant response
+        with st.chat_message("assistant"):
+            with st.spinner("Generating SQL query..."):
+                try:
+                    query = st.session_state.assistant.generate_sql_query(prompt)
+
+                    if query:
+                        st.write("Generated SQL Query:")
+                        st.code(query, language="sql")
+
+                        # Execute query with progress indicator
+                        with st.spinner("Executing query..."):
+                            result = st.session_state.assistant.execute_query(query)
+
+                        if result['success']:
+                            # Update query history
+                            history_entry = {
+                                'query': query,
+                                'success': True,
+                                'timestamp': pd.Timestamp.now().isoformat()
+                            }
+
+                            if 'data' in result:
+                                st.write("Query Results:")
+                                st.dataframe(
+                                    result['data'],
+                                    use_container_width=True,
+                                    hide_index=True
+                                )
+                                history_entry['row_count'] = len(result['data'])
+                                message = {
+                                    "role": "assistant",
+                                    "content": "Here are the query results:",
+                                    "query": query,
+                                    "data": result['data']
+                                }
+                            else:
+                                st.success(result['message'])
+                                message = {
+                                    "role": "assistant",
+                                    "content": result['message'],
+                                    "query": query
+                                }
+
+                            st.session_state.query_history.append(history_entry)
+
+                        else:
+                            error_message = f"Error executing query: {result['error']}"
+                            st.error(error_message)
+
+                            # Log error
+                            st.session_state.error_log.append({
+                                'message': result['error'],
+                                'timestamp': pd.Timestamp.now().isoformat(),
+                                'type': 'Execution Error',
+                                'query': query
+                            })
+
+                            message = {
+                                "role": "assistant",
+                                "content": error_message,
+                                "query": query
+                            }
+
+                    else:
+                        error_message = (
+                            "Could not generate a precise SQL query. Please:\n"
+                            "- Be more specific about the data you need\n"
+                            "- Use exact table or column names if possible\n"
+                            "- Provide more context about your request"
+                        )
+                        st.error(error_message)
+
+                        # Log error
+                        st.session_state.error_log.append({
+                            'message': 'Failed to generate query',
+                            'timestamp': pd.Timestamp.now().isoformat(),
+                            'type': 'Generation Error'
+                        })
+
+                        message = {
+                            "role": "assistant",
+                            "content": error_message
+                        }
+
+                    st.session_state.messages.append(message)
+
+                except Exception as e:
+                    error_message = f"An unexpected error occurred: {str(e)}"
+                    st.error(error_message)
+
+                    # Log error
+                    st.session_state.error_log.append({
+                        'message': str(e),
+                        'timestamp': pd.Timestamp.now().isoformat(),
+                        'type': 'System Error'
+                    })
+
+
+if __name__ == "__main__":
+    main()
+
